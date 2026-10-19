@@ -331,6 +331,9 @@ public:
                         std::span<const DeviceKVPageHandle> destination,
                         RankStreams streams = {}) const;
 
+    // Diagnostic only: number of physically contiguous runs in the given page order.
+    [[nodiscard]] std::size_t contiguous_runs(std::span<const DeviceKVPageHandle> pages) const;
+
 private:
     friend class DeviceKVPageLease;
     friend class DeviceKVPageReservation;

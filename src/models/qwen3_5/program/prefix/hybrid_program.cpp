@@ -1077,6 +1077,11 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
 
         request.prefill->elapsed_seconds =
             std::chrono::duration<double>(Clock::now() - started).count();
+        // The speculative auto-bypass state is per request: a fresh request must start with the
+        // full neural drafter instead of inheriting a dead-drafter verdict left on this lane by
+        // whatever ran here before it.
+        request.draft_bypass_strikes = 0;
+        request.draft_bypass         = false;
         request.lifecycle = Lifecycle::Prefilling;
 
         HybridCacheCounters& counters = hybrid_->counters();

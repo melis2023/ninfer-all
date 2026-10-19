@@ -29,6 +29,12 @@ def _open_named_source(name: str, path: Path):
         # The ternary and GGUF block recipes read their block formats themselves, without gguf-py.
         if name in ("ternary", "gguf", "ngram"):
             return GGUFFile(path)
+        if name == "dflash2":
+            # The draft release's own GGUF: no `qwen3_5` metadata, so its geometry comes from
+            # the `dflash.*` keys (see dflash2_gguf).
+            from .dflash2_gguf import DraftSource
+
+            return DraftSource(path)
         from .sources.gguf_source import GGUFSource
 
         return GGUFSource(path)

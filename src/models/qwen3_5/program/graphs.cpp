@@ -247,6 +247,8 @@ void ProgramImpl::prepare_graphs() {
                     checked_i32(frontier, "graph representative DFlash frontier");
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
+                dflash_host_ingress->draft_frontiers[row] =
+                    checked_i32(frontier, "graph representative DFlash draft frontier");
                 dflash_host_ingress->proposal_valid_columns[row] =
                     static_cast<std::int32_t>(draft_window + 1U);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
@@ -275,6 +277,7 @@ void ProgramImpl::prepare_graphs() {
                 mtp_host_ingress->anchors[row] = 0;
                 mtp_host_ingress->base_frontiers[row] =
                     checked_i32(frontier, "graph representative MTP frontier");
+                mtp_host_ingress->logical_frontiers[row] = mtp_host_ingress->base_frontiers[row];
                 mtp_host_ingress->remaining_budgets[row] =
                     checked_i32(capacity, "graph representative MTP budget");
                 mtp_host_ingress->current_extents[row] = static_cast<std::int32_t>(extent);
@@ -303,6 +306,8 @@ void ProgramImpl::prepare_graphs() {
                 ordinary_host_ingress->tokens[row] = 0;
                 ordinary_host_ingress->cache_positions[row] =
                     checked_i32(frontier, "graph representative ordinary position");
+                ordinary_host_ingress->logical_frontiers[row] =
+                    checked_i32(frontier, "graph representative ordinary RNG frontier");
                 ordinary_host_ingress->rope_positions[row] =
                     checked_i32(frontier, "graph representative ordinary RoPE position");
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
@@ -325,7 +330,8 @@ void ProgramImpl::prepare_graphs() {
                                         stage_runtime.get(),
                                         rope_yarn,
                                         fast_prefill_kernel,
-                                        mtp_attention_window};
+                                        mtp_attention_window,
+                                        memory_candidate_statistics ? &*memory_candidate_statistics : nullptr};
     };
 
     const auto& text_attention = *parameters.model.config().text.attention;
@@ -336,8 +342,8 @@ void ProgramImpl::prepare_graphs() {
 
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles =
-            ordinary_graph_profiles(capacity, attention_geometry, kv_storage);
-        validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
+            ordinary_graph_profiles(kvmem_window_tokens ? kvmem_window_tokens : capacity, attention_geometry, kv_storage);
+        validate_graph_profiles(ordinary_profiles, (kvmem_window_tokens ? kvmem_window_tokens : capacity) - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
         execution::OrdinaryBatchContext ordinary_state{
             execution_core(),      decoder->text_kv,
@@ -379,9 +385,9 @@ void ProgramImpl::prepare_graphs() {
         constexpr std::uint32_t kMtpClassesPerWidth = 64;
         for (std::uint32_t verify_window = first_window; verify_window <= draft_window;
              ++verify_window) {
-            const auto planned_profiles = mtp_graph_profiles(capacity, verify_window, draft_window,
+            const auto planned_profiles = mtp_graph_profiles(kvmem_window_tokens ? kvmem_window_tokens : capacity, verify_window, draft_window,
                                                              attention_geometry, kv_storage);
-            validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+            validate_graph_profiles(planned_profiles, (kvmem_window_tokens ? kvmem_window_tokens : capacity) - 1, "MTP");
             for (const GraphExecutionProfile& planned : planned_profiles) {
                 if (planned.topology_class >= kMtpClassesPerWidth) {
                     throw std::logic_error("MTP graph profiles exceed the classes of one width");
@@ -396,17 +402,19 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store()};
             const GraphExecutionProfile code_warm = planned_profiles.front();
-            prepare_representative(code_warm.min, 1, verify_window);
-            device.synchronize();
-            execution::mtp_decode_batch(mtp_state, 1, verify_window, draft_window,
-                                        mtp_causal_attention_envelopes(code_warm.max, verify_window,
-                                                                       draft_window, capacity),
-                                        nullptr);
-            device.synchronize();
-
             mtp_graphs.profiles.reserve(mtp_graphs.profiles.size() +
                                         planned_profiles.size() * max_concurrency);
             for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                // Batch width can select a different linear route. Initialize its lazy handles
+                // outside capture, including GGUF's cuBLAS route above 64 verification columns.
+                prepare_representative(code_warm.min, batch_size, verify_window);
+                device.synchronize();
+                execution::mtp_decode_batch(mtp_state, static_cast<std::int32_t>(batch_size),
+                                            verify_window, draft_window,
+                                            mtp_causal_attention_envelopes(code_warm.max, verify_window,
+                                                draft_window, kvmem_window_tokens ? kvmem_window_tokens : capacity),
+                                            nullptr);
+                device.synchronize();
                 for (const GraphExecutionProfile planned : planned_profiles) {
                     mtp_graphs.profiles.emplace_back();
                     DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
@@ -422,7 +430,7 @@ void ProgramImpl::prepare_graphs() {
                         mtp_state, static_cast<std::int32_t>(batch_size), verify_window,
                         draft_window,
                         mtp_causal_attention_envelopes(planned.max, verify_window, draft_window,
-                                                       capacity),
+                                                       kvmem_window_tokens ? kvmem_window_tokens : capacity),
                         profile.definition);
                 }
             }
@@ -432,9 +440,10 @@ void ProgramImpl::prepare_graphs() {
             // frame viewed at that width. Above 15 drafts only one request may be active.
             const std::uint32_t verify_window = ngram_draft_window;
             const std::uint32_t batch_limit   = verify_window > 15U ? 1U : max_concurrency;
-            const auto planned_profiles = mtp_graph_profiles(capacity, verify_window, draft_window,
+            const auto attention_capacity = kvmem_window_tokens ? kvmem_window_tokens : capacity;
+            const auto planned_profiles = mtp_graph_profiles(attention_capacity, verify_window, draft_window,
                                                              attention_geometry, kv_storage);
-            validate_graph_profiles(planned_profiles, capacity - 1, "ngram MTP");
+            validate_graph_profiles(planned_profiles, attention_capacity - 1, "ngram MTP");
             qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
             execution::MtpBatchContext mtp_state{execution_core(),
                                                  decoder->text_kv,
@@ -444,16 +453,16 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store()};
             const GraphExecutionProfile code_warm = planned_profiles.front();
-            prepare_representative(code_warm.min, 1, verify_window);
-            device.synchronize();
-            execution::mtp_decode_batch(mtp_state, 1, verify_window, draft_window,
-                                        mtp_causal_attention_envelopes(code_warm.max, verify_window,
-                                                                       draft_window, capacity),
-                                        nullptr);
-            device.synchronize();
-
             ngram_graphs.profiles.reserve(planned_profiles.size() * batch_limit);
             for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
+                prepare_representative(code_warm.min, batch_size, verify_window);
+                device.synchronize();
+                execution::mtp_decode_batch(mtp_state, static_cast<std::int32_t>(batch_size),
+                                            verify_window, draft_window,
+                                            mtp_causal_attention_envelopes(code_warm.max, verify_window,
+                                                draft_window, attention_capacity),
+                                            nullptr);
+                device.synchronize();
                 for (const GraphExecutionProfile planned : planned_profiles) {
                     ngram_graphs.profiles.emplace_back();
                     DecodeGraphProfile& profile    = ngram_graphs.profiles.back();
@@ -467,7 +476,7 @@ void ProgramImpl::prepare_graphs() {
                         mtp_state, static_cast<std::int32_t>(batch_size), verify_window,
                         draft_window,
                         mtp_causal_attention_envelopes(planned.max, verify_window, draft_window,
-                                                       capacity),
+                                                       attention_capacity),
                         profile.definition);
                 }
             }
@@ -480,11 +489,17 @@ void ProgramImpl::prepare_graphs() {
             // batch>1 copy round also runs the drafter so rows without a copy keep their neural
             // proposal.
             const std::uint32_t family_window = copy ? ngram_draft_window : draft_window;
+            // KVMem sizes the device window to B+R, so DFlash profiles stay on that window and
+            // are validated against it, exactly like the ordinary and MTP families. Each captured
+            // profile uses its own frontier range as the envelope so the captured graph is
+            // identical to the envelope the runtime selects for that profile.
+            const std::uint32_t dflash_capacity =
+                kvmem_window_tokens ? kvmem_window_tokens : capacity;
             DecodeGraphFamily& family         = copy ? ngram_graphs : dflash_graphs;
             const std::uint32_t batch_limit   = copy && family_window > 15U ? 1U : max_concurrency;
             const auto batch_one_profiles =
-                dflash_graph_profiles(speculative_backend, capacity, family_window, 1);
-            validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
+                dflash_graph_profiles(speculative_backend, dflash_capacity, family_window, 1);
+            validate_graph_profiles(batch_one_profiles, dflash_capacity - 1, "DFlash");
             execution::DFlashBatchContext dflash_state{execution_core(),
                                                        decoder->text_kv,
                                                        *dflash,
@@ -498,11 +513,11 @@ void ProgramImpl::prepare_graphs() {
             const ops::CausalAttentionExecutionEnvelope code_warm_target{
                 1,
                 static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                    capacity, static_cast<std::uint64_t>(code_warm.max) + family_window + 1ULL))};
+                    dflash_capacity, static_cast<std::uint64_t>(code_warm.max) + family_window + 1ULL))};
             prepare_representative(code_warm.min, 1, family_window);
             device.synchronize();
             execution::dflash_decode_batch(dflash_state, 1, family_window,
-                                           dflash_envelopes(code_warm.min, code_warm.max),
+                                           dflash_envelopes(code_warm.min, code_warm.max, capacity),
                                            code_warm_target, nullptr);
             device.synchronize();
 
@@ -510,9 +525,9 @@ void ProgramImpl::prepare_graphs() {
             for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
                 const auto planned_profiles =
                     batch_size == 1 ? batch_one_profiles
-                                    : dflash_graph_profiles(speculative_backend, capacity,
+                                    : dflash_graph_profiles(speculative_backend, dflash_capacity,
                                                             family_window, batch_size);
-                validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+                validate_graph_profiles(planned_profiles, dflash_capacity - 1, "DFlash");
                 for (const GraphExecutionProfile planned : planned_profiles) {
                     family.profiles.emplace_back();
                     DecodeGraphProfile& profile    = family.profiles.back();
@@ -525,12 +540,79 @@ void ProgramImpl::prepare_graphs() {
                         planned.topology_class * max_concurrency + (batch_size - 1U);
                     const ops::CausalAttentionExecutionEnvelope target_envelope{
                         1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                               capacity,
+                               dflash_capacity,
                                static_cast<std::uint64_t>(planned.max) + family_window + 1ULL))};
 
                     execution::capture_dflash_decode_batch(
                         dflash_state, static_cast<std::int32_t>(batch_size), family_window,
-                        dflash_envelopes(planned.min, planned.max), target_envelope,
+                        dflash_envelopes(planned.min, planned.max, capacity), target_envelope,
+                        profile.definition);
+                }
+            }
+        }
+
+        // P0-2: a bypassed request runs draftless rounds that skip the neural drafter and verify
+        // the anchor alone at width two. They are captured as their own family for the same reason
+        // the copy rounds are: a different width installs a different executable in the same
+        // topology slot, so mixing them with the neural family would make the two widths evict
+        // each other's graphs on every alternation.
+        {
+            const std::uint32_t family_window = 1U;
+            const std::uint32_t dflash_capacity =
+                kvmem_window_tokens ? kvmem_window_tokens : capacity;
+            const std::uint32_t batch_limit = max_concurrency;
+            const auto batch_one_profiles =
+                dflash_graph_profiles(speculative_backend, dflash_capacity, family_window, 1);
+            validate_graph_profiles(batch_one_profiles, dflash_capacity - 1, "DFlash draftless");
+            execution::DFlashBatchContext draftless_state{
+                execution_core(),
+                decoder->text_kv,
+                *dflash,
+                *io.dflash_decode,
+                *dflash_host_ingress,
+                *dflash_host_egress,
+                state_images->continuation_hidden_store()};
+            draftless_state.ngram                  = false;
+            draftless_state.neural_proposal_drafts = 0U;
+            const GraphExecutionProfile code_warm = batch_one_profiles.front();
+            const ops::CausalAttentionExecutionEnvelope code_warm_target{
+                1,
+                static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    dflash_capacity,
+                    static_cast<std::uint64_t>(code_warm.max) + family_window + 1ULL))};
+            prepare_representative(code_warm.min, 1, family_window);
+            device.synchronize();
+            execution::dflash_decode_batch(draftless_state, 1, family_window,
+                                           dflash_envelopes(code_warm.min, code_warm.max, capacity),
+                                           code_warm_target, nullptr);
+            device.synchronize();
+
+            draftless_graphs.profiles.reserve(batch_one_profiles.size() * batch_limit);
+            for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
+                const auto planned_profiles =
+                    batch_size == 1
+                        ? batch_one_profiles
+                        : dflash_graph_profiles(speculative_backend, dflash_capacity,
+                                                family_window, batch_size);
+                validate_graph_profiles(planned_profiles, dflash_capacity - 1, "DFlash draftless");
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    draftless_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = draftless_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    // Like a copy round, a draftless round selects by its own width.
+                    profile.verify_window = family_window;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    const ops::CausalAttentionExecutionEnvelope target_envelope{
+                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                               dflash_capacity,
+                               static_cast<std::uint64_t>(planned.max) + family_window + 1ULL))};
+
+                    execution::capture_dflash_decode_batch(
+                        draftless_state, static_cast<std::int32_t>(batch_size), family_window,
+                        dflash_envelopes(planned.min, planned.max, capacity), target_envelope,
                         profile.definition);
                 }
             }
@@ -549,6 +631,9 @@ void ProgramImpl::prepare_graphs() {
     }
     if (is_masked_draft_backend(speculative_backend)) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_profile);
+    }
+    if (!draftless_graphs.profiles.empty()) {
+        instantiate_graph_family(draftless_graphs, "DFlash draftless", device, prepare_profile);
     }
     if (!ngram_graphs.profiles.empty()) {
         instantiate_graph_family(ngram_graphs, "ngram", device, prepare_profile);

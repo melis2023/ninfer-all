@@ -764,6 +764,19 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
         sequence.mtp_draft_count = 0;
     } else if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = retained->main_frontier;
+        // The ring snapshot covers the trailing window; reselected history below the recent
+        // pages must not feed the draft.
+        const std::uint64_t recent_tokens =
+            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) *
+            static_cast<std::uint64_t>(kPagedKVPageSize);
+        sequence.dflash_context_floor = retained->main_frontier > recent_tokens
+            ? static_cast<std::uint32_t>(retained->main_frontier - recent_tokens) : 0U;
+        // The restored ring lives in the sequence's current write slot; re-anchor it there so a
+        // later slot change is detected as a fork instead of copying stale lanes over it.
+        sequence.dflash_state_slot =
+            state_store->valid(sequence.state.write) && state_store->valid(sequence.state.read)
+                ? state_store->selectors(sequence.state.read, sequence.state.write).destination
+                : -1;
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(sequence);

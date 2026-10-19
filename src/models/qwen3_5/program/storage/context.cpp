@@ -6,6 +6,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <span>
@@ -246,9 +248,15 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.prefix_identity.clear();
     sequence.prefix_digests.clear();
     sequence.rope_delta              = 0;
+    sequence.window = {};
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+    // A recycled slot starts with an empty draft ring. Without clearing the floor a stale value
+    // from a longer previous request masks every ring row of the next (shorter) one, so the
+    // draft silently reads nothing and acceptance collapses to ~0.
+    sequence.dflash_context_floor    = 0;
+    sequence.dflash_state_slot       = -1;
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.endpoint_valid          = false;
@@ -965,6 +973,10 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
         runtime::PrefillStepResult step = advance_prefill_raw(lane, failed_timing);
         if (failed_timing != nullptr) { *failed_timing += step.timing; }
         return wrap_prefill(lane, std::move(step));
+    } catch (const kvmem::MemoryError&) {
+        // Engine owns resource settlement. Keep the sequence capability valid
+        // until it can abort this request outside any peer's open transaction.
+        throw;
     } catch (...) {
         const Clock::time_point cleanup_started = Clock::now();
         clear_execution_failure_lanes(std::span<const std::uint32_t>(&lane, 1));
@@ -1152,6 +1164,18 @@ bool ProgramImpl::state_exclusive_to_sequence(const SequenceState& sequence,
            owned_checkpoint_references(sequence, state);
 }
 
+void ProgramImpl::clamp_masked_draft_floor(SequenceState& sequence) noexcept {
+    if (sequence.dflash_context_floor > sequence.dflash_context_frontier) {
+        sequence.dflash_context_floor = sequence.dflash_context_frontier;
+    }
+}
+
+std::uint32_t ProgramImpl::masked_draft_ring_capacity() const noexcept {
+    if (!is_masked_draft_backend(speculative_backend)) { return 0U; }
+    const auto& draft = parameters.model.config().draft;
+    return draft ? draft->sliding_window.value_or(0U) : 0U;
+}
+
 void ProgramImpl::refresh_state_views(SequenceState& sequence) {
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
@@ -1168,6 +1192,10 @@ void ProgramImpl::refresh_state_views(SequenceState& sequence) {
         sequence.rewrite_checkpoint_hidden = state_images->continuation_hidden_slot(
             state_store->physical_slot(*sequence.rewrite_state));
     }
+    // Every frontier transition passes through here (request admission, prefix reuse,
+    // materialization, checkpoint restore, prefill chunk binds), and several of them rewrite the
+    // frontier without touching the floor.
+    clamp_masked_draft_floor(sequence);
 }
 
 void ProgramImpl::reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots) {
@@ -1447,6 +1475,40 @@ std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& sequence) const
     return 0;
 }
 
+void ProgramImpl::set_backend_kv_valid(SequenceState& sequence, std::uint32_t frontier) noexcept {
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        sequence.mtp_kv_valid = frontier;
+        return;
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        sequence.dflash_context_frontier = frontier;
+    }
+}
+
+std::uint32_t ProgramImpl::kvmem_backend_frontier(const SequenceState& sequence) const noexcept {
+    if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
+    // Both masked draft backends maintain dflash_context_frontier (see commit.cpp, which
+    // repairs a lagging masked-draft frontier by appending the gap). backend_kv_valid()
+    // narrows this to DFlash on purpose; the KVMem window needs the real value for DFlash2.
+    if (speculative_backend == SpeculativeBackend::DFlash ||
+        speculative_backend == SpeculativeBackend::DFlash2) {
+        return sequence.dflash_context_frontier;
+    }
+    return 0;
+}
+
+void ProgramImpl::kvmem_set_backend_frontier(SequenceState& sequence,
+                                             std::uint32_t frontier) noexcept {
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        sequence.mtp_kv_valid = frontier;
+        return;
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash ||
+        speculative_backend == SpeculativeBackend::DFlash2) {
+        sequence.dflash_context_frontier = frontier;
+    }
+}
+
 void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                                  std::uint32_t backend_pages) {
     if (!sequence.kv || text_pages == 0 ||
@@ -1521,7 +1583,7 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
 
 void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
                                            std::uint32_t backend_tokens) {
-    if (!context_cache.kv_lease_growth) { return; }
+    if (kvmem_window_tokens || !context_cache.kv_lease_growth) { return; }
     // Only a decode step may extend the lease: materialization during admission has to leave the
     // sequence holding exactly the entitlement its plan declared.
     RequestControl& request = requests[sequence.lane];
@@ -1704,9 +1766,9 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
     ensure_sequence_kv_lease(sequence, main_tokens, backend_tokens);
-    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, compute_streams);
+    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, compact_position(sequence, main_tokens), compute_streams);
     if (backend_tokens != 0) {
-        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
+        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, compact_position(sequence, backend_tokens),
                                                       compute_streams);
     }
 }
@@ -1717,9 +1779,9 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
     }
-    text_kv_addresses->commit_frontier(sequence.kv->text, main_tokens);
+    text_kv_addresses->commit_frontier(sequence.kv->text, compact_position(sequence, main_tokens));
     if (sequence.kv->backend) {
-        backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
+        backend_kv_addresses->commit_frontier(*sequence.kv->backend, compact_position(sequence, backend_tokens));
     }
     if (hybrid_) { hybrid_publish_blocks(sequence); }
 }
@@ -1732,9 +1794,9 @@ void ProgramImpl::trim_sequence_kv(SequenceState& sequence, std::uint32_t main_t
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
-    text_kv_addresses->destructive_truncate(sequence.kv->text, main_tokens);
+    text_kv_addresses->destructive_truncate(sequence.kv->text, compact_position(sequence, main_tokens));
     if (sequence.kv->backend) {
-        backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
+        backend_kv_addresses->destructive_truncate(*sequence.kv->backend, compact_position(sequence, backend_tokens));
     }
 }
 
@@ -1831,9 +1893,12 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
     set_device_i32(io.rope_pos, 0);
     set_device_i32(io.rope_delta, 0);
     if (io.mtp) { set_device_i32(io.mtp->position, 0); }
+    sequence.window = {};
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+    sequence.dflash_context_floor    = 0;
+    sequence.dflash_state_slot       = -1;
 }
 
 

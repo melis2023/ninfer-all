@@ -5,6 +5,9 @@
 #include "ninfer/types.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <new>
@@ -718,7 +721,9 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
                                      std::byte* host_base, std::size_t host_pitch,
                                      const HostKVPageLayout& host, RankStreams streams) const {
     const bool to_host = kind == cudaMemcpyDeviceToHost;
+    static const bool plane_timing = std::getenv("KVMEM_PLANE_TIMING") != nullptr;
     for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
+        const auto plane_t0 = std::chrono::steady_clock::now();
         const Tensor& plane                 = planes_[plane_index];
         const cudaStream_t stream           = streams[plane_ranks_[plane_index]];
         const HoldingDeviceBinding bind(plane_devices_[plane_index]);
@@ -746,6 +751,16 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
                          static_cast<std::int64_t>(first) * plane.nb[2],
                      plane.nb[2], host_plane.head_payload_bytes);
             }
+        }
+        if (plane_timing) {
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - plane_t0).count();
+            const double bytes = double(count) * double(host_plane.page_payload_bytes);
+            std::fprintf(stderr,
+                "KVMEM_PLANE plane=%zu count=%zu width=%zu us=%lld gbps=%.2f nb2=%lld nb3=%lld ptr=%p\n",
+                plane_index, count, host_plane.page_payload_bytes, (long long)us,
+                us > 0 ? (bytes / 1e9) / (double(us) / 1e6) : 0.0,
+                (long long)plane.nb[2], (long long)plane.nb[3], plane.data);
         }
     }
 }
@@ -808,6 +823,15 @@ void DeviceKVPagePool::copy_from_host(const std::byte* source, const HostKVPageL
                       host.page_stride, host, streams);
         begin = end;
     }
+}
+
+std::size_t DeviceKVPagePool::contiguous_runs(std::span<const DeviceKVPageHandle> pages) const {
+    if (pages.empty()) { return 0; }
+    std::size_t runs = 1;
+    for (std::size_t i = 1; i < pages.size(); ++i) {
+        if (physical_index(pages[i]) != physical_index(pages[i - 1]) + 1) { ++runs; }
+    }
+    return runs;
 }
 
 std::size_t DeviceKVPagePool::host_record_run_end(std::span<const DeviceKVPageHandle> pages,

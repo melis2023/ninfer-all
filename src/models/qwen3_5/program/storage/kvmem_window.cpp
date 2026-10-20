@@ -183,6 +183,10 @@ public:
                 throw std::logic_error("KVMem selected page has no native payload");
             selected.push_back(id);
         }
+        // Stable page order is what makes a slot-by-slot diff meaningful: the same logical
+        // page keeps the same physical slot across reselections, so the next restore can
+        // skip it instead of copying it back from the host.
+        std::sort(selected.begin(), selected.end());
         if (seq.text_kv_valid % page_tokens &&
             (selected.empty() || selected.back() != seq.text_kv_valid / page_tokens)) {
             throw std::logic_error("KVMem partial append page must remain the last selected page");
@@ -343,10 +347,36 @@ public:
         auto& seq = backend.sequence;
         const auto restore_t0 = std::chrono::steady_clock::now();
         bind_staging();
+        // Decide reuse before reading the host records: an unchanged slot already has the
+        // right bytes in its device replica, so it does not need to cross the staging buffer.
+        const auto& previous = seq.window.pages;
+        // The window may hold more pages than the selection budget: the reserve tail is
+        // appended to the address space but not kept by the selector. Compare the prefix
+        // only, so an unchanged selection still counts as reuse.
+        const bool enough = previous.size() >= selected.size();
+        std::vector<std::uint32_t> changed;
+        if (enough) {
+            changed.reserve(selected.size());
+            for (std::uint32_t i = 0; i < selected.size(); ++i) {
+                if (previous[i] != selected[i]) changed.push_back(i);
+            }
+        }
+        const std::size_t selection_pages =
+            static_cast<std::size_t>(backend.program.kvmem_options.selected_tokens / page_tokens);
+        const bool incremental = !checked && enough &&
+            changed.size() * 2 <= selected.size() &&
+            selected.size() >= std::max<std::size_t>(1, selection_pages / 2);
+        std::fprintf(stderr, "KVMEM_RESTORE_DIFF prev=%zu sel=%zu changed=%zu same=%d inc=%d\n",
+            previous.size(), selected.size(), changed.size(), int(enough), int(incremental));
         if (asynchronous) {
             if (!host_published) throw std::logic_error("KVMem restored before storage completion");
             if (storage_work->restored.size())
                 std::memcpy(p.memory_kv_staging->data(), storage_work->restored.data(), storage_work->restored.size());
+        } else if (incremental) {
+            for (const std::uint32_t i : changed) {
+                record(selected[i])->read(0,
+                    static_cast<std::byte*>(p.memory_kv_staging->data()) + i * backend.page_bytes, backend.page_bytes);
+            }
         } else {
             for (std::size_t i = 0; i < selected.size(); ++i) {
                 record(selected[i])->read(0,
@@ -354,34 +384,64 @@ public:
             }
         }
         const auto restore_t_read = std::chrono::steady_clock::now();
-        destructive = true;
-        p.text_kv_addresses->destructive_truncate(seq.kv->text, 0);
+        destructive = !incremental;
+        if (!incremental) {
+            p.text_kv_addresses->destructive_truncate(seq.kv->text, 0);
+        } else if (previous.size() > selected.size()) {
+            // Trim the reserve tail that the selector did not keep, while preserving the
+            // mapping (and therefore the device replicas) of the retained prefix. The
+            // frontier is the visible token count, not selected.size() * page_tokens: the
+            // last page may be partial, and commit_frontier() rejects a smaller value.
+            const auto frontier = static_cast<std::uint32_t>(plan.next.visible_tokens);
+            p.text_kv_addresses->destructive_truncate(seq.kv->text, frontier);
+        }
         const auto compact_end = static_cast<std::uint32_t>(plan.next.visible_tokens) + backend.end - seq.text_kv_valid;
         p.text_kv_addresses->ensure_mapped_to_tokens(seq.kv->text, compact_end, p.compute_streams);
         if (backend.mtp_layout) {
-            p.backend_kv_addresses->destructive_truncate(*seq.kv->backend, 0);
+            if (!incremental) {
+                p.backend_kv_addresses->destructive_truncate(*seq.kv->backend, 0);
+            } else if (previous.size() > selected.size()) {
+                const auto frontier = static_cast<std::uint32_t>(plan.next.visible_tokens);
+                p.backend_kv_addresses->destructive_truncate(*seq.kv->backend, frontier);
+            }
             p.backend_kv_addresses->ensure_mapped_to_tokens(*seq.kv->backend, compact_end, p.compute_streams);
         }
         const auto restore_t_remap = std::chrono::steady_clock::now();
+        std::vector<std::uint32_t> slots;
+        if (incremental) {
+            slots = std::move(changed);
+        } else {
+            slots.resize(selected.size());
+            for (std::uint32_t i = 0; i < selected.size(); ++i) slots[i] = i;
+        }
         std::vector<DeviceKVPageHandle> destinations;
-        for (std::uint32_t i = 0; i < selected.size(); ++i) {
+        std::vector<const std::byte*> records;
+        destinations.reserve(slots.size());
+        records.reserve(slots.size());
+        for (const std::uint32_t i : slots) {
             destinations.push_back(p.text_kv_addresses->physical_page(seq.kv->text, i));
+            records.push_back(restore_records[i]);
         }
         auto& pool = p.text_kv_pages->physical_pool();
         // All records are page slots of one pinned staging buffer, so every record has the
         // same allocation group; feeding block ids here would forbid run merging and turn
         // each plane copy into one transfer per page.
-        pool.copy_from_host_records(restore_records, {}, destinations, backend.layout, p.compute_streams);
+        if (!records.empty()) {
+            pool.copy_from_host_records(records, {}, destinations, backend.layout, p.compute_streams);
+        }
         std::vector<DeviceKVPageHandle> mtp_destinations;
         if (backend.mtp_layout) {
             std::vector<const std::byte*> mtp_records;
-            for (std::size_t i = 0; i < selected.size(); ++i) {
-                mtp_destinations.push_back(p.backend_kv_addresses->physical_page(*seq.kv->backend,
-                    static_cast<std::uint32_t>(i)));
+            mtp_destinations.reserve(slots.size());
+            mtp_records.reserve(slots.size());
+            for (const std::uint32_t i : slots) {
+                mtp_destinations.push_back(p.backend_kv_addresses->physical_page(*seq.kv->backend, i));
                 mtp_records.push_back(restore_records[i] + backend.layout.page_stride);
             }
-            p.backend_kv_pages->physical_pool().copy_from_host_records(mtp_records, {},
-                mtp_destinations, *backend.mtp_layout, p.compute_streams);
+            if (!mtp_records.empty()) {
+                p.backend_kv_pages->physical_pool().copy_from_host_records(mtp_records, {},
+                    mtp_destinations, *backend.mtp_layout, p.compute_streams);
+            }
         }
         const auto restore_t_submit = std::chrono::steady_clock::now();
         p.device.synchronize();
@@ -433,7 +493,7 @@ public:
                 throw std::logic_error("KVMem page transfer changed recurrent state");
             }
         }
-        seq.window.restored_bytes += selected.size() * backend.page_bytes;
+        seq.window.restored_bytes += slots.size() * backend.page_bytes;
     }
 
     void publish(const kvmem::ExecutionView& view) override {

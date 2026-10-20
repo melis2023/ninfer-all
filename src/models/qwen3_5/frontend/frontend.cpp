@@ -1343,7 +1343,15 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
-    result.memory_query = TokenSpan{0, result.token_ids.size()};
+    // Token-only prompts have no chat boundary that marks the current intent,
+    // so the retrieval query used to be the mean of the whole prompt. For a
+    // 256K input that mean vector is diluted into noise and every block scores
+    // almost the same. Score against the prompt tail instead. Long chat prompts
+    // carry their own final-user region and do not take this path.
+    constexpr std::size_t token_query_tail = 1024;
+    const std::size_t query_begin = result.token_ids.size() > token_query_tail
+        ? result.token_ids.size() - token_query_tail : 0;
+    result.memory_query = TokenSpan{query_begin, result.token_ids.size() - query_begin};
     if (impl_->ngram_sources_enabled) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         build_ngram_index(result);

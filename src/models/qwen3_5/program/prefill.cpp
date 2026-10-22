@@ -999,6 +999,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 }
             }
         }
+        // Candidate statistics belong to verification, not Fold. Read them
+        // before Fold so host bookkeeping can overlap the state update.
+        read_memory_candidates();
         const std::span<const ops::GdnReplayFoldRow> fold_span(fold_rows.data(), lanes.size());
         {
             // Each state shard folds its own layers on its own device's stream.
@@ -1111,7 +1114,6 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
     const std::uint32_t width = verify_drafts + 1U;
     try {
-        read_memory_candidates();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);
             RequestControl& request = requests[lanes[row]];
@@ -1257,6 +1259,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 staged.waiting_for_storage = true;
                 staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
                 return runtime::PrefillStepResult{.summary = summary, .timing = timing.finish()};
+            }
+            if (memory_io && chunk_end < staged.prompt_tokens) {
+                // RAM lookahead: prepare the next chunk's host records while this GPU chunk
+                // runs. prepare_window joins and publishes them before their first use.
+                (void)prepare_memory_append(sequence, chunk_end,
+                    std::min(staged.prompt_tokens, chunk_end + prefill_chunk), true);
             }
         }
         bind_sequence_kv(sequence);

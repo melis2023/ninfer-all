@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/context_work.h"
 
 #include "core/paged_kv_cache.h"
+#include "kvmem/prefix_checkpoint.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -984,10 +985,15 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
 bool ProgramImpl::memory_same_query(const KvmemWindowState& window, const PreparedPromptData& prompt,
                                     std::uint32_t frontier) const {
     if (!prompt.memory_query || !window.query_tokens ||
-        window.query_tokens != window.query_end - window.query_begin || frontier < window.query_end) return false;
+        window.query_tokens != window.query_end - window.query_begin) return false;
     const auto& query = *prompt.memory_query;
     // The caller's exact checkpoint match proves all tokens/positions through this range.
-    return query.begin == window.query_begin && query.count == window.query_tokens;
+    if (query.begin != window.query_begin || query.count != window.query_tokens) return false;
+    // LCP boundary: a reuse may not restore past the evaluated frontier. The replay itself
+    // keeps the committed query sum, so no logits are needed at the boundary.
+    const auto limit = kvmem::prefix_restore_limit(
+        window.query_end, window.query_end, frontier, /*needs_logits=*/false);
+    return limit >= window.query_end;
 }
 
 void ProgramImpl::capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept {

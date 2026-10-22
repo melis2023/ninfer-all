@@ -12,3 +12,5 @@ include("${CMAKE_CURRENT_LIST_DIR}/q6/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/q8/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/t2/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gguf/sources.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/sm70/sources.cmake")

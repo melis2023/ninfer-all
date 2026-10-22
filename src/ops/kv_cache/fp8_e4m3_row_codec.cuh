@@ -74,6 +74,12 @@ __device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2(std::uint16_t sto
     value.__x = storage;
     return static_cast<__half2>(value);
 }
+// Two E4M3FN codes per byte, expanded to two halves (x2 multiplier 8 form).
+__device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2_x2m8(unsigned codes) {
+    const unsigned pair = __byte_perm(codes, 0u, 0x4140);
+    const unsigned bits = ((pair & 0x007f007fu) << 7) | ((pair & 0x00800080u) << 8);
+    return *reinterpret_cast<const __half2*>(&bits);
+}
 
 __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint16_t storage,
                                                                        __half scale) {

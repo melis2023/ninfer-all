@@ -78,6 +78,13 @@ kv_cache_nvfp4_quantize_group16(const float* source) {
     return result;
 }
 
+// Two E2M1 codes per byte as halves, using the 8-entry E2M1 table and the sign bit.
+__device__ __forceinline__ __half2 kv_cache_e2m1x2_to_half2(unsigned codes) {
+    const unsigned select = ((codes & 0x7u) << 4) | ((codes & 0x70u) << 8);
+    const unsigned bits   = __byte_perm(0x3E3C3800u, 0x46444240u, select) | ((codes & 0x8u) << 12) |
+                            ((codes & 0x80u) << 24);
+    return *reinterpret_cast<const __half2*>(&bits);
+}
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t* codes,
                                                              std::uint8_t scale_code) {
     // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable

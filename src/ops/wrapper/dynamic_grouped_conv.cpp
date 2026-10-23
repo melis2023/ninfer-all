@@ -3,6 +3,7 @@
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <array>
 #include <cmath>
@@ -59,6 +60,12 @@ std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
 }
 
 void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
+    if (weight.qtype == QType::NVFP4) {
+        if (weight.n != kHidden || weight.k != input_rows) {
+            throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
+        }
+        return; // the full NVFP4 payload contract is validated by the linear route
+    }
     const std::uint64_t payload_bytes = required_q8_payload_bytes(input_rows);
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
@@ -225,6 +232,15 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
     require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kAddOp,
                    "finish_delta");
     require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual");
+    if (projection_weight.qtype == QType::NVFP4) {
+        require_finish_projection_weight(projection_weight, input_rows);
+        (void)detail::validate_nvfp4_weight(projection_weight, kAddOp);
+        require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
+                                  workspace);
+        detail::materialized_linear_dynamic_grouped_conv_add_dispatch(
+            x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
+        return;
+    }
     if (materialized_projection(projection_weight, input_rows)) {
         require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
                                   workspace);

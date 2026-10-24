@@ -1,14 +1,17 @@
-#include "core/weight.h"
+﻿#include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 struct Plan {
     Q8DynamicConvAddSchedule schedule;
-    std::size_t workspace_bytes;
+    std::size_t workspace_bytes;      // arena capacity for one dispatch
+    std::size_t projected_bytes;      // the projected BF16 matrix this dispatch allocates
+    std::size_t gguf_workspace_bytes; // Linear's own staging, allocated inside Linear
 };
 
 Plan resolve_plan(int input_rows, int width, int batch) {
@@ -19,7 +22,15 @@ Plan resolve_plan(int input_rows, int width, int batch) {
     const int columns = width * batch;
     using S           = Q8DynamicConvAddSchedule;
     const S schedule  = columns <= 88 ? S::TiledMma : S::MmaK128;
-    return {schedule, static_cast<std::size_t>(5120) * columns * sizeof(std::uint16_t)};
+    const std::size_t projected = static_cast<std::size_t>(5120) * columns * sizeof(std::uint16_t);
+    // A carried GGUF block projection is materialised through the generic linear route, which
+    // stages its own q8_1 activations. Reserve the widest of the K-quants the drafter ships.
+    const std::size_t gguf = std::max(
+        linear_workspace_capacity_bytes(QType::GGUF_Q3_K, 5120, input_rows, LinearPolicy::A16Only,
+                                        1, columns),
+        linear_workspace_capacity_bytes(QType::GGUF_Q4_K, 5120, input_rows, LinearPolicy::A16Only,
+                                        1, columns));
+    return {schedule, projected + gguf, projected, gguf};
 }
 } // namespace
 
@@ -60,10 +71,17 @@ void materialized_linear_dynamic_grouped_conv_add_dispatch(
     const Tensor& finish_delta, Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
     const Plan plan           = resolve_plan(x.ne[0], x.ne[1], x.ne[2]);
     auto scope                = workspace.scope();
-    const DeviceSpan storage  = workspace.alloc_bytes(plan.workspace_bytes);
+    const DeviceSpan storage  = workspace.alloc_bytes(plan.projected_bytes);
     const std::int32_t tokens = x.ne[1] * x.ne[2];
     Tensor projected(storage.data, DType::BF16, {5120, tokens});
-    linear(x.view({x.ne[0], tokens}), projection_weight, projected, stream);
+    if (is_gguf(projection_weight.qtype)) {
+        // GGUF blocks are dequantised inside Linear, which allocates its own staging from
+        // the same arena; resolve_plan already reserved that headroom.
+        linear(x.view({x.ne[0], tokens}), projection_weight, projected, LinearPolicy::A16Only,
+               workspace, stream);
+    } else {
+        linear(x.view({x.ne[0], tokens}), projection_weight, projected, stream);
+    }
     dynamic_grouped_conv_finish_launch(projected, base_kernel, finish_delta, residual, x.ne[1],
                                        stream);
 }

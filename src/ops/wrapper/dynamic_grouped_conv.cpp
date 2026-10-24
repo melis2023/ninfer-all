@@ -83,7 +83,9 @@ void require_finish_projection_weight(const Weight& weight, std::int32_t input_r
 // A row-split projection of any other format goes through Linear, which validates its registered
 // format and shape; the fused routes are Q8's.
 bool materialized_projection(const Weight& weight, std::int32_t input_rows) {
-    return weight.qtype != QType::Q8_G32_FP16 && weight.layout == QuantLayout::RowSplit &&
+    const bool row_split   = weight.layout == QuantLayout::RowSplit;
+    const bool gguf_blocks = weight.layout == QuantLayout::GgufBlocks && is_gguf(weight.qtype);
+    return weight.qtype != QType::Q8_G32_FP16 && (row_split || gguf_blocks) &&
            weight.ndim == 2 && weight.n == kHidden && weight.k == input_rows &&
            weight.qdata != nullptr && weight.payload != nullptr;
 }
